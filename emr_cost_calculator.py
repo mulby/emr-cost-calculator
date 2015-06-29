@@ -22,6 +22,7 @@ Options:
 from docopt import docopt
 import boto.emr
 import boto.ec2
+import boto.vpc
 import boto.ec2.cloudwatch
 from retrying import retry
 import sys
@@ -53,7 +54,7 @@ def retry_if_EmrResponseError(exception):
     Use this function in order to back off only
     on EmrResponse errors and not in other exceptions
     """
-    if isinstance(exception, boto.exception.EmrResponseError) or isinstance(exception, AttributeError):
+    if isinstance(exception, boto.exception.EmrResponseError):
         print >> sys.stderr, '[WARN] EmrResponseError detected, backing off before retrying.'
         return True
     return False
@@ -72,7 +73,7 @@ class Ec2Instance:
             ec2_cost = lifetime * pricing
         else:
             sorted_pricing = sorted(pricing, key=attrgetter('timestamp'))
-            ec2_cost = -1
+            ec2_cost = None
             current_time = creation_ts
             idx = 0
             while current_time < termination_ts and idx < len(sorted_pricing):
@@ -85,7 +86,7 @@ class Ec2Instance:
                         next_timestamp = termination_ts
                         current_time = termination_ts
 
-                    if ec2_cost == -1:
+                    if ec2_cost == None:
                         time_diff = next_timestamp - creation_ts
                         ec2_cost = 0
                     else:
@@ -93,6 +94,9 @@ class Ec2Instance:
 
                     ec2_cost += (time_diff.total_seconds() / 3600.0) * pricing.price
                 idx += 1
+
+            if ec2_cost is None:
+                ec2_cost = lifetime * pricing.price
 
         self.cost = ec2_cost + emr_cost
         print >> sys.stderr, '[DEBUG] Instance cost ${0} for {1} hours of computation.'.format(self.cost, lifetime)
@@ -131,6 +135,11 @@ class EmrCostCalculator:
                     aws_secret_access_key=aws_secret_access_key)
 
             self.cw_conn = boto.ec2.cloudwatch.connect_to_region(
+                    region,
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key)
+
+            self.vpc_conn = boto.vpc.connect_to_region(
                     region,
                     aws_access_key_id=aws_access_key_id,
                     aws_secret_access_key=aws_secret_access_key)
@@ -248,18 +257,24 @@ class EmrCostCalculator:
                     end_time = datetime.datetime.utcnow().isoformat()
 
                 if instance_group.market == 'SPOT':
+                    try:
+                        availability_zone = cluster.ec2instanceattributes.ec2availabilityzone
+                    except AttributeError:
+                        subnets = self.vpc_conn.get_all_subnets(subnet_ids=[cluster.ec2instanceattributes.ec2subnetid])
+                        availability_zone = subnets[0].availability_zone
+
                     print >> sys.stderr, \
                         '[DEBUG] Gathering spot market pricing data for {instance_type} from {from_date} to {to_date} in {az}.'.format(
                             instance_type=instance_group.instance_type,
                             from_date=start_time,
                             to_date=end_time,
-                            az=cluster.ec2instanceattributes.ec2availabilityzone
+                            az=availability_zone
                         )
                     pricing = self.ec2_conn.get_spot_price_history(
                         instance_type=instance_group.instance_type,
                         start_time=start_time,
                         end_time=end_time,
-                        availability_zone=cluster.ec2instanceattributes.ec2availabilityzone
+                        availability_zone=availability_zone
                     )
                     print >> sys.stderr, '[DEBUG] Spot market data downloaded.'
                 else:
