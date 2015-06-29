@@ -53,7 +53,7 @@ def retry_if_EmrResponseError(exception):
     Use this function in order to back off only
     on EmrResponse errors and not in other exceptions
     """
-    if isinstance(exception, boto.exception.EmrResponseError):
+    if isinstance(exception, boto.exception.EmrResponseError) or isinstance(exception, AttributeError):
         print >> sys.stderr, '[WARN] EmrResponseError detected, backing off before retrying.'
         return True
     return False
