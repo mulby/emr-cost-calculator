@@ -352,6 +352,10 @@ class EmrCostCalculator:
                     cost=cluster_costs['TOTAL'],
                     timestamp=cluster_costs['termination_time']
                 )
+            total_cost = 0
+            for cost in clusters:
+                total_cost += cost['TOTAL']
+            print total_cost
         else:
             raise RuntimeError('Invalid output format: {}'.format(output_format))
 
