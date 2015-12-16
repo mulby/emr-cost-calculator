@@ -16,7 +16,8 @@ Options:
     --created-after=<ca>          The calculator will compute the cost for all the cluster created after the created-after day
     --created-before=<cb>         The calculator will compute the cost for all the cluster created before the created-before day
     --cluster-id=<ci>             The id of the cluster you want to calculate the cost for
-     --output=<format>            The output format, valid values are: json, cloudwatch, text or datadog
+    --output=<format>             The output format, valid values are: json, cloudwatch, text or datadog
+    --total-start=<ts>            The calculator will compute the cost from this time until now for all clusters that were active at this time
 """
 
 from docopt import docopt
@@ -62,12 +63,23 @@ def retry_if_EmrResponseError(exception):
 
 class Ec2Instance:
 
-    def __init__(self, creation_ts, termination_ts, pricing, overhead):
+    def __init__(self, creation_ts, termination_ts, pricing, overhead, total_start):
         self.creation_time = creation_ts
         creation_ts = Ec2Instance._parse_date(creation_ts)
         self.termination_time = termination_ts
         termination_ts = Ec2Instance._parse_date(termination_ts)
+        self.total_start_time = total_start
+
+        if total_start >= termination_ts:
+            self.cost = 0
+            self.lifetime = 0
+            return
+
+        if creation_ts <= total_start < termination_ts:
+            creation_ts = total_start
+
         lifetime = math.ceil((termination_ts - creation_ts).total_seconds() / 3600.0)
+        self.lifetime = lifetime
         emr_cost = lifetime * overhead
         if isinstance(pricing, float):
             ec2_cost = lifetime * pricing
@@ -99,7 +111,6 @@ class Ec2Instance:
                 ec2_cost = lifetime * pricing.price
 
         self.cost = ec2_cost + emr_cost
-        print >> sys.stderr, '[DEBUG] Instance cost ${0} for {1} hours of computation.'.format(self.cost, lifetime)
 
     @staticmethod
     def _parse_date(timestamp):
@@ -147,15 +158,15 @@ class EmrCostCalculator:
             print >> sys.stderr, \
                 '[ERROR] Could not establish connection with EMR api'
 
-    def get_total_cost_by_dates(self, created_after, created_before):
+    def get_total_cost_by_dates(self, created_after, created_before, total_start):
         print >> sys.stderr, '[INFO] Finding clusters created between {after} and {before}.'.format(
             after=created_after.isoformat(),
             before=created_before.isoformat()
         )
         total_cost = 0
         cluster_costs = []
-        for cluster in self._get_cluster_list(created_after, created_before):
-            cost_dict = self.get_cluster_cost(cluster)
+        for cluster in self._get_cluster_list(created_after, created_before, total_start):
+            cost_dict = self.get_cluster_cost(cluster, total_start)
             cluster_costs.append(cost_dict)
             total_cost += cost_dict['TOTAL']
         return cluster_costs
@@ -163,7 +174,7 @@ class EmrCostCalculator:
     @retry(wait_exponential_multiplier=500,
            wait_exponential_max=7000,
            retry_on_exception=retry_if_EmrResponseError)
-    def get_cluster_cost(self, cluster):
+    def get_cluster_cost(self, cluster, total_start):
         """
         Joins the information from the instance groups and the instances
         in order to calculate the price of the whole cluster
@@ -186,14 +197,22 @@ class EmrCostCalculator:
             print >> sys.stderr, '[DEBUG] Analyzing instance group {ig}'.format(
                 ig=instance_group.group_type
             )
-            for instance in self._get_instances(instance_group, cluster):
+            first = True
+            for instance in self._get_instances(instance_group, cluster, total_start):
                 cost_dict.setdefault(instance_group.group_type, 0)
                 cost_dict[instance_group.group_type] += instance.cost
                 cost_dict.setdefault('TOTAL', 0)
                 cost_dict['TOTAL'] += instance.cost
                 cost_dict['creation_time'] = instance.creation_time
                 cost_dict['termination_time'] = instance.termination_time
+                cost_dict['lifetime'] = instance.lifetime
                 cost_dict['date'] = instance.creation_time.split('T')[0]
+
+                if first:
+                    print >> sys.stderr, '[DEBUG] Instance cost ${0} for {1} hours of computation.'.format(
+                        instance.cost, instance.lifetime
+                    )
+                    first = False
 
         return EmrCostCalculator._sanitise_floats(cost_dict)
 
@@ -209,7 +228,7 @@ class EmrCostCalculator:
                 aDict[key] = round(aDict[key], 3)
         return aDict
 
-    def _get_cluster_list(self, created_after, created_before):
+    def _get_cluster_list(self, created_after, created_before, total_start):
         """
         :return: An iterator of cluster ids for the specified dates
         """
@@ -220,6 +239,11 @@ class EmrCostCalculator:
                                         created_before,
                                         marker=marker)
             for cluster in cluster_list.clusters:
+                cluster_end_time = getattr(cluster.status.timeline, 'enddatetime', None)
+                if cluster_end_time:
+                    end_time_ts = Ec2Instance._parse_date(cluster_end_time)
+                    if end_time_ts <= total_start:
+                        continue
                 yield self.conn.describe_cluster(cluster.id)
             try:
                 marker = cluster_list.marker
@@ -237,7 +261,7 @@ class EmrCostCalculator:
             instance_groups.append(InstanceGroup(group))
         return instance_groups
 
-    def _get_instances(self, instance_group, cluster):
+    def _get_instances(self, instance_group, cluster, total_start):
         """
         Invokes the EMR api to retrieve a list of all the instances
         that were used in the cluster.
@@ -285,7 +309,8 @@ class EmrCostCalculator:
                             start_time,
                             end_time,
                             pricing,
-                            instance_group.overhead)
+                            instance_group.overhead,
+                            total_start)
                 yield inst
             except AttributeError:
                 print >> sys.stderr, \
@@ -293,12 +318,6 @@ class EmrCostCalculator:
                     % cluster.id
 
     def output_cluster_costs(self, costs, output_format):
-        for cluster_costs in costs:
-            print >> sys.stderr, '[DEBUG] Cluster {name} cost ${cost} on {timestamp}'.format(
-                name=cluster_costs['name'],
-                cost=cluster_costs['TOTAL'],
-                timestamp=cluster_costs['termination_time']
-            )
         if output_format == 'json':
             print json.dumps(costs)
         elif output_format == 'cloudwatch':
@@ -321,18 +340,18 @@ class EmrCostCalculator:
             for cluster_costs in costs:
                 python_timestamp = Ec2Instance._parse_date(cluster_costs['termination_time'])
                 posix_timestamp = time.mktime(python_timestamp.timetuple())
-                import pdb; pdb.set_trace()
                 datadog.api.Metric.send(
                     metric='edx.analytics.emr.cost',
                     points=(posix_timestamp, cluster_costs['TOTAL']),
                     tags=['jobflowname' + cluster_costs['name']]
                 )
         elif output_format == 'text':
-            total_cost = 0
-            for cost in clusters:
-                total_cost += cost['TOTAL']
-
-            print total_cost
+            for cluster_costs in costs:
+                print >> sys.stderr, '[DEBUG] Cluster {name} cost ${cost} on {timestamp}'.format(
+                    name=cluster_costs['name'],
+                    cost=cluster_costs['TOTAL'],
+                    timestamp=cluster_costs['termination_time']
+                )
         else:
             raise RuntimeError('Invalid output format: {}'.format(output_format))
 
@@ -345,11 +364,11 @@ if __name__ == '__main__':
 
     if args.get('total'):
         current_time = datetime.datetime.utcnow()
-        one_day_ago = current_time - datetime.timedelta(days=1)
+        one_day_ago = current_time - datetime.timedelta(hours=23)
 
         created_after_str = args.get('--created-after')
         if not created_after_str:
-            created_after = one_day_ago
+            created_after = current_time - datetime.timedelta(days=365)
         else:
             created_after = validate_date(created_after_str)
 
@@ -359,7 +378,13 @@ if __name__ == '__main__':
         else:
             created_before = validate_date(created_before_str)
 
-        clusters = calc.get_total_cost_by_dates(created_after, created_before)
+        total_start_str = args.get('--total-start')
+        if not total_start_str:
+            total_start = one_day_ago
+        else:
+            total_start = validate_date(total_start_str)
+
+        clusters = calc.get_total_cost_by_dates(created_after, created_before, total_start)
     elif args.get('cluster'):
         cluster = calc.conn.describe_cluster(args.get('--cluster-id'))
         clusters = [calc.get_cluster_cost(cluster)]
