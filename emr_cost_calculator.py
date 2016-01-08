@@ -235,9 +235,9 @@ class EmrCostCalculator:
         marker = None
         while True:
             cluster_list = \
-                self.conn.list_clusters(created_after,
-                                        created_before,
-                                        marker=marker)
+                self._get_raw_cluster_list(created_after,
+                                           created_before,
+                                           marker=marker)
             for cluster in cluster_list.clusters:
                 cluster_end_time = getattr(cluster.status.timeline, 'enddatetime', None)
                 if cluster_end_time:
@@ -249,6 +249,14 @@ class EmrCostCalculator:
                 marker = cluster_list.marker
             except AttributeError:
                 break
+
+    @retry(wait_exponential_multiplier=500,
+           wait_exponential_max=7000,
+           retry_on_exception=retry_if_EmrResponseError)
+    def _get_raw_cluster_list(self, created_after, created_before, marker):
+        return self.conn.list_clusters(created_after,
+                                       created_before,
+                                       marker=marker)
 
     def _get_instance_groups(self, cluster):
         """
