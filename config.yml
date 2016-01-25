@@ -3,7 +3,9 @@ prices:
     m1.medium: 0.087
     m1.large: 0.175
     m3.xlarge: 0.266
+    r3.xlarge: 0.333
 emr:
     m1.medium: 0.022
     m1.large: 0.044
     m3.xlarge: 0.070
+    r3.xlarge: 0.090
