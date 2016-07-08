@@ -281,7 +281,10 @@ class EmrCostCalculator:
         pricing = None
         for instance_info in instance_list:
             if pricing is None:
-                timeline = instance_info.status.timeline
+                if instance_info.status:
+                    timeline = instance_info.status.timeline
+                elif cluster.status:
+                    timeline = cluster.status.timeline
                 start_time = timeline.creationdatetime
                 if hasattr(timeline, 'enddatetime'):
                     end_time = timeline.enddatetime
